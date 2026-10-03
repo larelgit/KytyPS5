@@ -159,7 +159,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		auto trigger = std::max<int64_t>((budget - threshold) / 2, 0);
+		if (budget > threshold) {
+			// On cards with spare VRAM, do not evict idle textures until 60% of the budget is in
+			// use: re-uploading and re-detiling them costs more than the memory they free.
+			trigger = std::max(
+			    trigger, std::min(budget * 6 / 10, static_cast<int64_t>(m_pressure_gc_memory)));
+		}
+		m_trigger_gc_memory = static_cast<uint64_t>(trigger);
 	}
 }
 
@@ -1986,10 +1993,22 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// Without memory pressure, keep textures used within the last NormalGcFrames frames. A tick is
+	// one guest submission, so 16 ticks can be just a couple of frames.
+	constexpr uint64_t NormalGcFrames = 30;
+	uint64_t           normal_age     = tick;
+	if (m_gc_frames > NormalGcFrames) {
+		const auto frame_start =
+		    m_gc_frame_ticks[(m_gc_frames - NormalGcFrames) % m_gc_frame_ticks.size()];
+		normal_age = std::max<uint64_t>(tick - std::min(frame_start, tick), 16);
+	}
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		const uint64_t       age       = std::min<uint64_t>(aggressive  ? 160
+		                                                    : pressured ? 80
+		                                                                : normal_age,
+		                                                    tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -2035,6 +2054,12 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
+}
+
+void TextureCache::MarkFrameBoundary() {
+	std::scoped_lock lock {m_lock};
+	m_gc_frame_ticks[m_gc_frames % m_gc_frame_ticks.size()] = m_gc_tick;
+	++m_gc_frames;
 }
 
 void TextureCache::ProcessDownloadImages() {

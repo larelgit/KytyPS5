@@ -55,6 +55,8 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	// Called on the GPU thread for every guest flip.
+	void MarkFrameBoundary() { m_texture_cache.MarkFrameBoundary(); }
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

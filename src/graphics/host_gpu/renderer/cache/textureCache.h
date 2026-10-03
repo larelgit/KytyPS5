@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <type_traits>
@@ -72,6 +73,9 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Called once per presented frame. Garbage-collection ticks count guest submissions, which
+	// vary per frame, so the normal-pressure eviction age is measured in frames instead.
+	void MarkFrameBoundary();
 	// True when queued GPU work can still read or write guest memory in the range: a cached
 	// image or surface metadata overlaps it, or an image download has not been published yet.
 	[[nodiscard]] bool HasPendingGpuAccess(uint64_t address, uint64_t size);
@@ -185,6 +189,9 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	// GC tick at the start of each recent frame, indexed by frame number modulo the size.
+	std::array<uint64_t, 64> m_gc_frame_ticks {};
+	uint64_t                 m_gc_frames              = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 	// Downloads publish into guest memory from a completion callback, after the image may
