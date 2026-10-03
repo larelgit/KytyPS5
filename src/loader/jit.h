@@ -3,6 +3,9 @@
 
 #include "common/abi.h"
 
+#include <cstdint>
+#include <initializer_list>
+
 namespace Loader::Jit {
 
 #pragma pack(1)
@@ -53,10 +56,10 @@ struct TlsRegStub {
 
 	void SetOutputReg(uint8_t reg) { code[15] = 0xc0u | (reg & 7u); }
 
-	static uint64_t GetOffset(uint8_t reg) {
+	static constexpr uint64_t GetOffset(uint8_t reg) {
 		return 0x100 + static_cast<uint64_t>(reg) * GetSize();
 	}
-	static uint64_t GetSize() { return 32; }
+	static constexpr uint64_t GetSize() { return 32; }
 
 	// sub rsp,0x80
 	// push rax
@@ -70,12 +73,66 @@ struct TlsRegStub {
 	                    0x00, 0x00, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 };
 
+// Loads the guest thread pointer from a host thread-local slot with one segment-relative load
+// (Windows: a TEB TLS slot through gs; Linux: an initial-exec thread_local through fs) and falls
+// back to the slow handler while the slot is empty. A patched `mov <reg>, fs:[0]` calls it.
+// Only LEA, MOV, PUSH/POP and JRCXZ run on the fast path, so guest flags are preserved, and
+// the guest red zone below the return address is skipped before anything is pushed.
+struct TlsFastStub {
+	static constexpr uint64_t GetOffset(uint8_t reg) {
+		return 0x200 + static_cast<uint64_t>(reg) * GetSize();
+	}
+	static constexpr uint64_t GetSize() { return 64; }
+
+	// segment is the prefix byte (0x64 fs, 0x65 gs); slow_target is the existing handler for
+	// the same register, entered as if called from the patched site.
+	void Generate(uint8_t reg, uint8_t segment, int32_t displacement, uint64_t self_address,
+	              uint64_t slow_target) {
+		uint32_t size = 0;
+		auto     emit = [&](std::initializer_list<uint8_t> bytes) {
+			for (const auto byte: bytes) {
+				code[size++] = byte;
+			}
+		};
+		auto emit32 = [&](uint32_t value) {
+			for (int i = 0; i < 4; i++) {
+				code[size++] = static_cast<uint8_t>(value >> (8 * i));
+			}
+		};
+		emit({0x48, 0x8D, 0x64, 0x24, 0x80});    // lea rsp, [rsp-0x80]
+		emit({0x51});                            // push rcx
+		emit({segment, 0x48, 0x8B, 0x0C, 0x25}); // mov rcx, seg:[disp32]
+		emit32(static_cast<uint32_t>(displacement));
+		emit({0xE3, 0x00}); // jrcxz slow
+		const auto jrcxz_end = size;
+		if (reg == 1) {
+			emit({0x48, 0x8D, 0x64, 0x24, 0x08}); // lea rsp, [rsp+8]: drop the saved rcx
+		} else {
+			emit({0x48, 0x89, static_cast<uint8_t>(0xC8u | reg)}); // mov <reg>, rcx
+			emit({0x59});                                          // pop rcx
+		}
+		emit({0x48, 0x8D, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00}); // lea rsp, [rsp+0x80]
+		emit({0xC3});                                           // ret
+		code[jrcxz_end - 1] = static_cast<uint8_t>(size - jrcxz_end);
+		emit({0x59});                                           // slow: pop rcx
+		emit({0x48, 0x8D, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00}); // lea rsp, [rsp+0x80]
+		emit({0xE9});                                           // jmp slow_target
+		const auto jmp_end = self_address + size + 4;
+		emit32(static_cast<uint32_t>(slow_target - jmp_end));
+		while (size < sizeof(code)) {
+			code[size++] = 0xCC;
+		}
+	}
+
+	uint8_t code[64] = {};
+};
+
 struct SafeCall {
 	using func_t = KYTY_MS_ABI uint8_t* (*)();
 
 	void SetFunc(func_t func) { *reinterpret_cast<func_t*>(&code[0x22]) = func; }
 
-	static uint64_t GetSize() { return 0x1000; }
+	static constexpr uint64_t GetSize() { return 0x1000; }
 
 	uint8_t code[0x90] = {
 	    /*00*/ 0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00, // sub    rsp,0x80

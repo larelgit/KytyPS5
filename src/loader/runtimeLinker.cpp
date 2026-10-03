@@ -923,16 +923,80 @@ static void ForEachRelocation(Program* program, auto&& func) {
 	}
 }
 
+// Host thread-local slot that patched `mov <reg>, fs:[0]` sites read through Jit::TlsFastStub.
+// It holds the calling thread's guest TCB once the slow handler has resolved it; while it is
+// empty the stub falls back to that handler, which fills it.
+struct GuestTcbFastSlot {
+	bool    available    = false;
+	uint8_t segment      = 0; // Segment-override prefix: 0x64 fs, 0x65 gs.
+	int32_t displacement = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DWORD index = TLS_OUT_OF_INDEXES;
+#endif
+};
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+// Initial-exec TLS in the executable sits at the same offset from the fs base in every thread.
+[[gnu::tls_model("initial-exec")]] static thread_local uint8_t* t_guest_tcb = nullptr;
+#endif
+
+static const GuestTcbFastSlot& GetGuestTcbFastSlot() {
+	static const GuestTcbFastSlot slot = [] {
+		GuestTcbFastSlot result;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The TEB stores the first 64 TlsAlloc values inline (TlsSlots at gs:[0x1480] on x64).
+		constexpr int32_t TEB_TLS_SLOTS    = 0x1480;
+		constexpr DWORD   TEB_INLINE_SLOTS = 64;
+		const DWORD       index            = TlsAlloc();
+		if (index != TLS_OUT_OF_INDEXES && index < TEB_INLINE_SLOTS) {
+			result.available    = true;
+			result.segment      = 0x65;
+			result.displacement = TEB_TLS_SLOTS + static_cast<int32_t>(index) * 8;
+			result.index        = index;
+		} else if (index != TLS_OUT_OF_INDEXES) {
+			TlsFree(index);
+		}
+#elif !defined(__APPLE__)
+		uintptr_t thread_pointer = 0;
+		asm volatile("mov %%fs:0, %0" : "=r"(thread_pointer));
+		const auto offset =
+		    static_cast<int64_t>(reinterpret_cast<uintptr_t>(&t_guest_tcb) - thread_pointer);
+		if (offset >= INT32_MIN && offset <= INT32_MAX) {
+			result.available    = true;
+			result.segment      = 0x64;
+			result.displacement = static_cast<int32_t>(offset);
+		}
+#endif
+		return result;
+	}();
+	return slot;
+}
+
+static void SetGuestTcbFastSlot([[maybe_unused]] uint8_t* tcb) {
+	[[maybe_unused]] const auto& slot = GetGuestTcbFastSlot();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (slot.available) {
+		TlsSetValue(slot.index, tcb);
+	}
+#elif !defined(__APPLE__)
+	if (slot.available) {
+		t_guest_tcb = tcb;
+	}
+#endif
+}
+
 static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 	EXIT_IF(g_tls_main_program == nullptr);
 
 	if (g_tls_cached_main_program == g_tls_main_program && g_tls_cached_main_tcb != nullptr) {
+		SetGuestTcbFastSlot(g_tls_cached_main_tcb);
 		return g_tls_cached_main_tcb;
 	}
 
 	g_tls_cached_main_program = g_tls_main_program;
 	g_tls_cached_main_tcb =
 	    RuntimeLinker::TlsGetAddr(g_tls_main_program) + g_tls_main_program->tls.tcb_offset;
+	SetGuestTcbFastSlot(g_tls_cached_main_tcb);
 	return g_tls_cached_main_tcb;
 }
 
@@ -1006,9 +1070,13 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				// overwrite it. Call9 starts with REX.W to neutralize genuine 0x66
 				// prefixes on AMD processors (before it could turn E8 into callw 16bit).
 				auto* code = new (inst_ptr) Jit::Call9;
-				code->SetFunc(reg == 0
-				                  ? program->tls.handler_vaddr
-				                  : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(reg));
+				if (GetGuestTcbFastSlot().available) {
+					code->SetFunc(program->tls.handler_vaddr + Jit::TlsFastStub::GetOffset(reg));
+				} else {
+					code->SetFunc(reg == 0 ? program->tls.handler_vaddr
+					                       : program->tls.handler_vaddr +
+					                             Jit::TlsRegStub::GetOffset(reg));
+				}
 				ptr += prefix_count + Jit::Call9::GetSize() - 1;
 			}
 		}
@@ -1315,6 +1383,7 @@ void RuntimeLinker::Clear() {
 	g_tls_main_program        = nullptr;
 	g_tls_cached_main_program = nullptr;
 	g_tls_cached_main_tcb     = nullptr;
+	SetGuestTcbFastSlot(nullptr);
 	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
 }
@@ -1762,6 +1831,7 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	if (thread_id == Common::Thread::GetThreadIdUnique() && g_tls_cached_main_program == program) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
+		SetGuestTcbFastSlot(nullptr);
 	}
 
 	Common::LockGuard lock(program->tls.mutex);
@@ -2004,6 +2074,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	if (g_tls_cached_main_program == program.get()) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
+		SetGuestTcbFastSlot(nullptr);
 	}
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr >= program->base_vaddr &&
@@ -2291,6 +2362,24 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 		                                          Jit::TlsRegStub::GetOffset(reg))) Jit::TlsRegStub;
 		stub->SetFunc(program->tls.handler_vaddr);
 		stub->SetOutputReg(reg);
+	}
+
+	if (const auto& fast = GetGuestTcbFastSlot(); fast.available) {
+		static_assert(Jit::TlsRegStub::GetOffset(7) + Jit::TlsRegStub::GetSize() <=
+		              Jit::TlsFastStub::GetOffset(0));
+		static_assert(Jit::TlsFastStub::GetOffset(7) + Jit::TlsFastStub::GetSize() <=
+		              Jit::SafeCall::GetSize());
+		for (uint8_t reg = 0; reg < 8; reg++) {
+			if (reg == 4) {
+				continue;
+			}
+			const auto address = program->tls.handler_vaddr + Jit::TlsFastStub::GetOffset(reg);
+			const auto slow    = reg == 0
+			                         ? program->tls.handler_vaddr
+			                         : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(reg);
+			auto*      stub    = new (reinterpret_cast<void*>(address)) Jit::TlsFastStub;
+			stub->Generate(reg, fast.segment, fast.displacement, address, slow);
+		}
 	}
 
 	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->tls.handler_vaddr,
