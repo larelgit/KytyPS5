@@ -923,10 +923,11 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t          fps_start      = Common::Timer::QueryPerformanceCounter();
+	static uint64_t          frame_num      = 0;
+	static uint64_t          fps_frames     = 0;
+	static double            current_fps    = 0.0;
+	static uint64_t          title_posted   = 0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -947,23 +948,34 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
-	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
-	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	// The title is set on the main thread. Post it at most twice per second without waiting:
+	// waiting on every present stalls the vblank thread whenever the main thread is busy, and
+	// for the whole of a window move or resize, when SDL does not run main-thread callbacks.
+	if (title_posted != 0 && now - title_posted < frequency / 2) {
+		return;
+	}
+	title_posted = now;
 
+	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+		SDL_Window* window;
+		std::string text;
+	};
+	auto* update = new TitleUpdate {
+	    window,
+	    fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL,
+	                build_type, (has_title ? title : ""), (has_title ? ", " : ""),
+	                (has_title_id ? title_id : ""), (has_title_id ? ", " : ""),
+	                (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""), device_name,
+	                processor_name, frame_num, current_fps)};
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        const std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		        SDL_SetWindowTitle(title->window, title->text.c_str());
+	        },
+	        update, false)) {
+		delete update;
+	}
 }
 
 } // namespace Libs::Graphics

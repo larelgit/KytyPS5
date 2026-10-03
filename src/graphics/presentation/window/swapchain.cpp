@@ -892,13 +892,14 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
-	auto              format = m_impl->frames.GetFormat();
-	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	auto  format = m_impl->frames.GetFormat();
+	auto* frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
 	if (producer != nullptr) {
+		// The producer is a renderer command buffer.
+		Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
@@ -978,9 +979,11 @@ void Presenter::Impl::Present() {
 			continue;
 		}
 		{
-			Common::LockGuard render_lock(renderer.GetMutex());
-			auto&             command = present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
+			// Presentation records only presenter-owned frames, swapchain images and overlay
+			// resources on its own scheduler, so it does not take the renderer mutex. Holding it
+			// would stall presentation for as long as the GPU thread compiles a shader.
+			auto&      command = present_scheduler.BeginCommand();
+			const bool draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);

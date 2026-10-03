@@ -190,6 +190,9 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	// Vblank count of the last presented flip; flip_rate is a minimum interval from it.
+	uint64_t                            last_flip_vblank = 0;
+	bool                                has_flipped      = false;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -496,7 +499,11 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	}
 	const int interval = cfg.flip_rate + 1;
 
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+	// Flip once at least `interval` vblanks have passed since the previous flip. A fixed phase
+	// (count % interval) would make a frame that is one vblank late wait a whole extra
+	// interval, turning a 30 fps game into 20 fps.
+	return interval <= 1 || !cfg.has_flipped ||
+	       cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(interval);
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -727,6 +734,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			output_mode_events = std::move(config.events->output_mode);
 		}
 		config.flip_rate   = 0;
+		config.has_flipped = false;
 		master             = config.master;
 		config.master      = nullptr;
 
@@ -876,11 +884,17 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
 		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
+		// After a stall, catch up at most one period instead of firing vblanks back to back:
+		// a burst of vblanks releases several queued flips at once and the game sees uneven
+		// frame pacing.
+		const auto max_catch_up = -static_cast<int64_t>(period);
+
 		if (m_presenter.IsGuestPaused()) {
 			(void)m_presenter.PresentLastFrame();
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
 			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+			total_wait = std::max(total_wait, max_catch_up);
 			continue;
 		}
 
@@ -923,6 +937,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+		total_wait = std::max(total_wait, max_catch_up);
 	}
 }
 
@@ -1264,6 +1279,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 			continue;
 		}
 		auto& r = *it;
+		r.cfg->last_flip_vblank = r.cfg->vblank_status.count;
+		r.cfg->has_flipped      = true;
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
