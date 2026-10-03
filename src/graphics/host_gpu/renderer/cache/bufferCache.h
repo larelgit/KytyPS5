@@ -90,6 +90,10 @@ public:
 		return m_memory_tracker.CpuDirtyEpoch();
 	}
 	[[nodiscard]] uint64_t BufferEpoch() const noexcept { return m_buffer_epoch; }
+	// Buffer uploads between these share one barrier before and one after all their copies
+	// instead of a pair per buffer. Only pure CPU-to-buffer synchronization may run in a batch.
+	void               BeginUploadBatch() noexcept;
+	void               EndUploadBatch();
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -154,7 +158,11 @@ private:
 	uint64_t m_gc_tick            = 0;
 	// Asynchronous downloads publish into guest memory from a completion callback.
 	std::atomic<uint32_t> m_pending_downloads {0};
-	uint64_t              m_buffer_epoch = 0;
+	uint64_t              m_buffer_epoch        = 0;
+	bool                  m_upload_batch_active = false;
+	// Submission tick whose command buffer already has the batch's leading barrier; 0 for none.
+	uint64_t m_upload_batch_tick       = 0;
+	bool     m_upload_batch_has_copies = false;
 };
 
 } // namespace Libs::Graphics

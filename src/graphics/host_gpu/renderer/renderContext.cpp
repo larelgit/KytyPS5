@@ -146,9 +146,11 @@ void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	if (!m_bda_synchronized || dirty_epoch != m_bda_dirty_epoch ||
 	    buffer_epoch != m_bda_buffer_epoch || m_mapped_ranges_epoch != m_bda_mapped_epoch) {
+		m_buffer_cache.BeginUploadBatch();
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 		});
+		m_buffer_cache.EndUploadBatch();
 		m_bda_synchronized = true;
 		m_bda_dirty_epoch  = dirty_epoch;
 		m_bda_buffer_epoch = buffer_epoch;

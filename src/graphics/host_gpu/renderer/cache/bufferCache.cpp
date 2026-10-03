@@ -394,7 +394,27 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source) {
+	if (source && m_upload_batch_active) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		if (m_upload_batch_tick != m_scheduler.CurrentTick()) {
+			// The batch's first upload, or the scheduler submitted and moved to a new command
+			// buffer. Pooled command buffer handles are reused, so compare submission ticks.
+			vk::MemoryBarrier before {};
+			before.srcAccessMask =
+			    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+			    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+			before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr,
+			                       0, nullptr);
+			m_upload_batch_tick = m_scheduler.CurrentTick();
+		}
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data());
+		m_upload_batch_has_copies = true;
+	} else if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -662,6 +682,33 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::BeginUploadBatch() noexcept {
+	EXIT_IF(m_upload_batch_active);
+	m_upload_batch_active     = true;
+	m_upload_batch_tick       = 0;
+	m_upload_batch_has_copies = false;
+}
+
+void BufferCache::EndUploadBatch() {
+	EXIT_IF(!m_upload_batch_active);
+	m_upload_batch_active = false;
+	if (!m_upload_batch_has_copies) {
+		return;
+	}
+	// The barrier orders every earlier command in submission order, including copies recorded
+	// into a command buffer that was submitted during the batch.
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                 vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0,
+	                                 nullptr, 0, nullptr);
+	m_upload_batch_tick       = 0;
+	m_upload_batch_has_copies = false;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
