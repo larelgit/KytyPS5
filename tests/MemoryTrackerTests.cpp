@@ -402,6 +402,51 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestCpuDirtyEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = page_size * 2;
+  const auto upload = [&](bool is_written) {
+    tracker.ForEachUploadRange(
+        address, size, is_written, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+
+  auto epoch = tracker.CpuDirtyEpoch();
+  upload(false);
+  Check(tracker.CpuDirtyEpoch() != epoch,
+        "a new tracker region did not advance the CPU dirty epoch");
+
+  epoch = tracker.CpuDirtyEpoch();
+  upload(false);
+  upload(true);
+  tracker.ForEachDownloadRange<true>(address, size,
+                                     [](uint64_t, uint64_t) noexcept {});
+  Check(tracker.CpuDirtyEpoch() == epoch,
+        "uploads or GPU ownership changes advanced the CPU dirty epoch");
+
+  tracker.InvalidateRegion(address + 16, 32, [] {});
+  Check(tracker.CpuDirtyEpoch() != epoch &&
+            tracker.IsRegionCpuModified(address, page_size),
+        "invalidation did not advance the CPU dirty epoch");
+
+  upload(false);
+  epoch = tracker.CpuDirtyEpoch();
+  tracker.MarkRegionAsCpuModified(address + page_size, 32);
+  Check(tracker.CpuDirtyEpoch() != epoch,
+        "explicit CPU dirtiness did not advance the CPU dirty epoch");
+
+  upload(false);
+  epoch = tracker.CpuDirtyEpoch();
+  tracker.UntrackMemory(address, size);
+  Check(tracker.CpuDirtyEpoch() != epoch,
+        "untracking did not advance the CPU dirty epoch");
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1130,6 +1175,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyEpoch();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

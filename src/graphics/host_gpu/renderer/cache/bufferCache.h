@@ -83,6 +83,13 @@ public:
 	// True when queued GPU work can still read or write guest memory in the range: a cached
 	// buffer overlaps it, or fault processing may create buffers when its tick completes.
 	[[nodiscard]] bool HasPendingGpuAccess(uint64_t vaddr, uint64_t size);
+	// Together these tell whether synchronizing every cached buffer can upload anything: the
+	// first advances when tracked pages may become CPU-modified, the second when buffers are
+	// created or merged.
+	[[nodiscard]] uint64_t CpuDirtyEpoch() const noexcept {
+		return m_memory_tracker.CpuDirtyEpoch();
+	}
+	[[nodiscard]] uint64_t BufferEpoch() const noexcept { return m_buffer_epoch; }
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -147,6 +154,7 @@ private:
 	uint64_t m_gc_tick            = 0;
 	// Asynchronous downloads publish into guest memory from a completion callback.
 	std::atomic<uint32_t> m_pending_downloads {0};
+	uint64_t              m_buffer_epoch = 0;
 };
 
 } // namespace Libs::Graphics

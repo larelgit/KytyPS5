@@ -45,6 +45,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
+	++m_buffer_epoch;
 }
 
 void BufferCache::Unregister(BufferId id) {

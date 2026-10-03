@@ -84,6 +84,13 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	// Advances under the exclusive mapped-ranges lock whenever m_mapped_ranges changes.
+	uint64_t m_mapped_ranges_epoch = 0;
+	// State observed by the last full PrepareBda synchronization.
+	bool     m_bda_synchronized = false;
+	uint64_t m_bda_dirty_epoch  = 0;
+	uint64_t m_bda_buffer_epoch = 0;
+	uint64_t m_bda_mapped_epoch = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

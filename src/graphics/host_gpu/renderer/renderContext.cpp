@@ -90,6 +90,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	++m_mapped_ranges_epoch;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -120,6 +121,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		++m_mapped_ranges_epoch;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -135,10 +137,23 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	// Shaders with direct memory access can read any cached buffer, so every CPU-modified page
+	// must be uploaded first. Skip the sweep over all cached buffers when no page has become
+	// CPU-modified, no buffer was created and no range was mapped since the last one. Read the
+	// epochs before synchronizing so a write that races with the sweep forces another one.
+	const auto       dirty_epoch  = m_buffer_cache.CpuDirtyEpoch();
+	const auto       buffer_epoch = m_buffer_cache.BufferEpoch();
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	if (!m_bda_synchronized || dirty_epoch != m_bda_dirty_epoch ||
+	    buffer_epoch != m_bda_buffer_epoch || m_mapped_ranges_epoch != m_bda_mapped_epoch) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		m_bda_synchronized = true;
+		m_bda_dirty_epoch  = dirty_epoch;
+		m_bda_buffer_epoch = buffer_epoch;
+		m_bda_mapped_epoch = m_mapped_ranges_epoch;
+	}
 	m_fault_process_pending = true;
 }
 

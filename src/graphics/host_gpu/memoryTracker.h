@@ -25,6 +25,12 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Advances whenever tracked pages may have become CPU-modified (writes, invalidation,
+	// untracking or a new tracker region). It advances after the pages are marked, so equal
+	// values mean every page that became CPU-dirty in between was visible to the first reader.
+	[[nodiscard]] uint64_t CpuDirtyEpoch() const noexcept {
+		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
@@ -51,6 +57,7 @@ public:
 				on_flush();
 			}
 		});
+		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -151,6 +158,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<uint64_t>                          m_cpu_dirty_epoch {0};
 };
 
 } // namespace Libs::Graphics

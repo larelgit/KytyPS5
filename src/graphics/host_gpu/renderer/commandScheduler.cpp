@@ -209,6 +209,13 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	{
+		// Every draw and dispatch calls this. Skip the semaphore query while nothing is queued.
+		std::lock_guard lock(m_operation_mutex);
+		if (m_pending_operations.empty()) {
+			return;
+		}
+	}
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
