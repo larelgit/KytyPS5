@@ -8,10 +8,14 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <stop_token>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 
@@ -100,12 +104,14 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
-// The owning renderer serializes access, including saves while the GPU is running.
+// The owning renderer serializes access. A background thread also saves the driver cache while
+// the GPU is running; Vulkan pipeline caches are internally synchronized.
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Stops the background saver, writes the driver cache and releases it.
 	void Save();
 
 	struct Pipeline {
@@ -174,11 +180,17 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	std::mutex                    m_save_mutex;
+	std::atomic<uint64_t>         m_created_pipelines {0};
+	uint64_t                      m_saved_pipelines = 0; // Guarded by m_save_mutex.
+	std::jthread                  m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
+	void SaveThread(std::stop_token stop);
+	bool WriteDriverCache();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
