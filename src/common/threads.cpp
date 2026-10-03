@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
@@ -153,6 +154,9 @@ struct CondVarPrivate {
 	~CondVarPrivate() = default;
 	KYTY_CLASS_NO_COPY(CondVarPrivate);
 	CONDITION_VARIABLE m_cv {};
+	// Advanced by every signal. Sub-millisecond waits sleep outside the condition variable and
+	// watch this counter so a signal still ends them early.
+	std::atomic<uint64_t> m_signal_epoch {0};
 #else
 	std::condition_variable_any m_cv;
 #endif
@@ -339,11 +343,43 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 }
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
+	if (micros == 0) {
+		// A zero timeout is a poll. Callers re-check their condition after every return.
+		return false;
+	}
 	bool ok = false;
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
 #ifdef KYTY_WIN_CS
+	if (micros < 1000) {
+		// SleepConditionVariableCS takes whole milliseconds, so a 100 us wait would last at
+		// least 1 ms. Sleep in short high-resolution steps outside the critical section and stop
+		// as soon as the condition variable is signaled. The caller enters the critical section
+		// exactly once, as SleepConditionVariableCS also requires.
+		constexpr int64_t StepMicros  = 100;
+		constexpr int64_t YieldMicros = 20;
+		auto&             epoch       = m_cond_var->m_signal_epoch;
+		const auto        start_epoch = epoch.load(std::memory_order_acquire);
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+		LeaveCriticalSection(&mutex->m_mutex->m_cs);
+		while (epoch.load(std::memory_order_acquire) == start_epoch) {
+			const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+			                           deadline - std::chrono::steady_clock::now())
+			                           .count();
+			if (remaining <= 0) {
+				break;
+			}
+			if (remaining <= YieldMicros) {
+				SwitchToThread();
+			} else {
+				SleepHighResolution100ns(static_cast<uint64_t>(std::min(remaining, StepMicros)) *
+				                         10);
+			}
+		}
+		EnterCriticalSection(&mutex->m_mutex->m_cs);
+		return epoch.load(std::memory_order_acquire) != start_epoch;
+	}
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
 	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
@@ -361,6 +397,7 @@ void CondVar::Signal() {
 #ifdef KYTY_WIN_CS
 	static auto func = ResolveWakeConditionVariable();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	m_cond_var->m_signal_epoch.fetch_add(1, std::memory_order_release);
 	func(&m_cond_var->m_cv);
 #else
 	m_cond_var->m_cv.notify_one();
@@ -371,6 +408,7 @@ void CondVar::SignalAll() {
 #ifdef KYTY_WIN_CS
 	static auto func = ResolveWakeAllConditionVariable();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	m_cond_var->m_signal_epoch.fetch_add(1, std::memory_order_release);
 	func(&m_cond_var->m_cv);
 #else
 	m_cond_var->m_cv.notify_all();
