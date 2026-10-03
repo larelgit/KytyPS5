@@ -602,12 +602,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.pa_cl_vs_out_cntl);
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
-		for (const float value: info.clip_space.scale) {
-			key.push_back(std::bit_cast<uint32_t>(value));
-		}
-		for (const float value: info.clip_space.offset) {
-			key.push_back(std::bit_cast<uint32_t>(value));
-		}
+		// The viewport scale and offset come from shader data at draw time.
 		for (const float value: info.clip_space.half_extent) {
 			key.push_back(std::bit_cast<uint32_t>(value));
 		}

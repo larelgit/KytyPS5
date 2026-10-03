@@ -1,6 +1,6 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
+#include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <atomic>
@@ -381,16 +381,21 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 	}
 }
 
-uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float scale,
-                               float offset, float half_extent) {
+uint32_t LoadShaderDataF32(EmitterState& state, uint32_t dword) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), value,
+	                          EmitShaderDataDwordLoad(state, dword));
+	return value;
+}
+
+uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, uint32_t scale,
+                               uint32_t offset, float half_extent) {
 	const auto window  = state.builder.AllocateId();
 	const auto biased  = state.builder.AllocateId();
 	const auto divided = state.builder.AllocateId();
 	const auto ndc     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpFMul, TypeF32(state), window, coordinate,
-	                          ConstantF32Value(state, scale));
-	state.builder.AddFunction(spv::OpFAdd, TypeF32(state), biased, window,
-	                          ConstantF32Value(state, offset));
+	state.builder.AddFunction(spv::OpFMul, TypeF32(state), window, coordinate, scale);
+	state.builder.AddFunction(spv::OpFAdd, TypeF32(state), biased, window, offset);
 	state.builder.AddFunction(spv::OpFDiv, TypeF32(state), divided, biased,
 	                          ConstantF32Value(state, half_extent));
 	state.builder.AddFunction(spv::OpFSub, TypeF32(state), ndc, divided,
@@ -400,16 +405,23 @@ uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float s
 
 uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 	const auto& transform = state.input_info.vertex->clip_space;
-	uint32_t    components[4] {};
+	const auto& bindings  = state.program.bindings;
+	EXIT_IF(bindings.clip_space_dwords != IR::BindingLayout::ClipSpaceDwordCount);
+	uint32_t components[4] {};
 	for (uint32_t i = 0; i < 4; i++) {
 		components[i] = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), components[i], position,
 		                          i);
 	}
-	components[0] = ConvertClipCoordinate(state, components[0], transform.scale[0],
-	                                      transform.offset[0], transform.half_extent[0]);
-	components[1] = ConvertClipCoordinate(state, components[1], transform.scale[1],
-	                                      transform.offset[1], transform.half_extent[1]);
+	// The draw writes the viewport scale and offset into shader data; the half extent is a
+	// device limit and stays part of the shader.
+	const auto clip = bindings.ClipSpaceDword();
+	components[0] =
+	    ConvertClipCoordinate(state, components[0], LoadShaderDataF32(state, clip),
+	                          LoadShaderDataF32(state, clip + 2), transform.half_extent[0]);
+	components[1] =
+	    ConvertClipCoordinate(state, components[1], LoadShaderDataF32(state, clip + 1),
+	                          LoadShaderDataF32(state, clip + 3), transform.half_extent[1]);
 	const auto converted = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), converted,
 	                          components[0], components[1], components[2], components[3]);

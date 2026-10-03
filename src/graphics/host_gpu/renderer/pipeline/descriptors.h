@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -45,6 +46,8 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
+	// Viewport scale and offset (x, y, x, y) for programs that convert clip-disabled positions.
+	std::array<uint32_t, ShaderRecompiler::IR::BindingLayout::ClipSpaceDwordCount> clip_space {};
 };
 
 [[nodiscard]] vk::DescriptorType

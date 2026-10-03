@@ -1081,8 +1081,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
+	// Programs compiled for clip-disabled draws read the viewport transform from shader data.
+	const auto&      screen_viewport = buffer.GetRegisters().GetScreenViewport().viewports[0];
+	const std::array clip_space {std::bit_cast<uint32_t>(screen_viewport.xscale),
+	                             std::bit_cast<uint32_t>(screen_viewport.yscale),
+	                             std::bit_cast<uint32_t>(screen_viewport.xoffset),
+	                             std::bit_cast<uint32_t>(screen_viewport.yoffset)};
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+		bindings.vertex[i].clip_space    = clip_space;
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
 	}
 	if (state.ps_active) {

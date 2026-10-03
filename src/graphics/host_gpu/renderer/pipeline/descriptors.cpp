@@ -858,6 +858,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
+	if (layout.clip_space_dwords != 0) {
+		EXIT_IF(layout.clip_space_dwords != prepared.clip_space.size());
+		std::ranges::copy(prepared.clip_space,
+		                  prepared.shader_data.begin() + layout.ClipSpaceDword());
+	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);

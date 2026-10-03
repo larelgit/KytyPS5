@@ -433,6 +433,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	CollectBuiltinInputs(program, next);
 	CollectOutputs(program, input_info, next);
+	next.clip_space_transform =
+	    program.stage != ShaderType::Pixel && program.stage != ShaderType::Compute &&
+	    input_info.vertex != nullptr && input_info.vertex->clip_space.enabled;
 	program.shader_info_complete = true;
 }
 

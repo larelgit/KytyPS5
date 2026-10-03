@@ -10769,8 +10769,17 @@ void TestNewShaderRecompilerClipDisabledPosition() {
         "disabled clip-space payload affected the shader cache key");
   auto shifted = clipped;
   shifted.clip_space.offset[0] += 1.0f;
-  Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(shifted),
-        "clip-disabled viewport transform is absent from the shader cache key");
+  shifted.clip_space.scale[1] *= 0.5f;
+  Check(MakeStageStaticKey(clipped) == MakeStageStaticKey(shifted),
+        "clip-disabled viewport scale or offset split the shader cache key");
+  Check(clipped_result.program.bindings.clip_space_dwords ==
+                ShaderRecompiler::IR::BindingLayout::ClipSpaceDwordCount &&
+            regular_result.program.bindings.clip_space_dwords == 0u,
+        "clip-disabled position export did not reserve viewport shader data");
+  auto wider = clipped;
+  wider.clip_space.half_extent[0] *= 2.0f;
+  Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(wider),
+        "clip-space half extent is absent from the shader cache key");
 }
 
 void TestNewShaderRecompilerAuxPositionExports() {

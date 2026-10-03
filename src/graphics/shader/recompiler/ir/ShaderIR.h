@@ -420,15 +420,21 @@ struct DescriptorBinding {
 };
 
 struct BindingLayout {
+	// Clip-disabled position exports read the viewport scale and offset (x, y, then x, y) from
+	// these shader-data dwords, so a new viewport does not need another shader.
+	static constexpr uint32_t ClipSpaceDwordCount = 4;
+
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	uint32_t                       clip_space_dwords     = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t ClipSpaceDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const { return ClipSpaceDword() + clip_space_dwords; }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
@@ -458,6 +464,8 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Position exports are converted from screen space with the draw's viewport.
+	bool clip_space_transform = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
