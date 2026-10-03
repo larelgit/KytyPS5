@@ -379,6 +379,18 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+#if !defined(__APPLE__)
+	vk_buffer.setDepthBoundsTestEnable(depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
+	if (depth.depth_bounds_test_enable) {
+		// Stored depth is within [0, 1], so clamping the bounds keeps the test result while
+		// satisfying Vulkan's range rule without VK_EXT_depth_range_unrestricted.
+		const auto clamp_bound = [](float value, float fallback) {
+			return std::isnan(value) ? fallback : std::clamp(value, 0.0f, 1.0f);
+		};
+		vk_buffer.setDepthBounds(clamp_bound(depth.depth_min_bounds, 0.0f),
+		                         clamp_bound(depth.depth_max_bounds, 1.0f));
+	}
+#endif
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
