@@ -3,6 +3,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1248,56 +1250,62 @@ static bool IsWaitSatisfied(const CommandBufferState::WaitAddressCommand& wait) 
 	}
 }
 
+// One worker per priority queue. Submissions in a queue run in order, one command at a time,
+// while queues progress independently, so a long low-priority read does not hold back a
+// higher-priority one and reads from different queues overlap.
 class CommandEngine {
 public:
-	explicit CommandEngine(size_t priorities)
-	    : m_queues(priorities), m_worker([this](std::stop_token stop) { Run(stop); }) {}
+	explicit CommandEngine(size_t priorities) {
+		for (size_t index = 0; index < priorities; index++) {
+			m_queues.push_back(std::make_unique<Queue>());
+		}
+		for (size_t index = 0; index < priorities; index++) {
+			m_workers.emplace_back(
+			    [this, index](std::stop_token stop) { Run(stop, *m_queues[index]); });
+		}
+	}
 
 	~CommandEngine() {
-		std::scoped_lock lock(m_mutex);
-		m_worker.request_stop();
-		m_cv.notify_all();
+		for (auto& worker: m_workers) {
+			worker.request_stop();
+		}
+		m_workers.clear();
 	}
 
 	void Submit(uint32_t priority, Submission submission) {
-		std::scoped_lock lock(m_mutex);
-		m_queues[priority].push_back(std::move(submission));
-		m_cv.notify_one();
+		auto&            queue = *m_queues[priority];
+		std::scoped_lock lock(queue.mutex);
+		queue.submissions.push_back(std::move(submission));
+		queue.ready.notify_one();
 	}
 
 private:
-	void Run(std::stop_token stop) {
-		std::unique_lock lock(m_mutex);
+	struct Queue {
+		std::mutex                  mutex;
+		std::condition_variable_any ready;
+		std::deque<Submission>      submissions;
+	};
+
+	static void Run(std::stop_token stop, Queue& queue) {
+		Common::Thread::SetCurrentPriority(Common::ThreadPriority::AboveNormal);
+		std::unique_lock lock(queue.mutex);
 		while (!stop.stop_requested()) {
-			std::deque<Submission>* ready   = nullptr;
-			bool                    pending = false;
-			for (auto& queue: m_queues) {
-				if (queue.empty()) {
-					continue;
-				}
-				pending          = true;
-				auto& submission = queue.front();
-				if (submission.cursor < submission.commands.size()) {
-					const auto* wait = std::get_if<CommandBufferState::WaitAddressCommand>(
-					    &submission.commands[submission.cursor].data);
-					if (wait != nullptr && !IsWaitSatisfied(*wait)) {
-						continue;
-					}
-				}
-				ready = &queue;
+			if (!queue.ready.wait(lock, stop, [&queue] { return !queue.submissions.empty(); })) {
 				break;
 			}
-			if (ready == nullptr) {
-				if (pending) {
-					// CPU and GPU fence writes do not notify the submission queue.
-					m_cv.wait_for(lock, std::chrono::microseconds(100));
-				} else {
-					m_cv.wait(lock);
+			auto& submission = queue.submissions.front();
+			if (submission.cursor < submission.commands.size()) {
+				const auto* wait = std::get_if<CommandBufferState::WaitAddressCommand>(
+				    &submission.commands[submission.cursor].data);
+				if (wait != nullptr && !IsWaitSatisfied(*wait)) {
+					// CPU and GPU fence writes do not notify the queue. Poll with a precise
+					// sleep: a timed condition-variable wait lasts at least 1 ms on Windows.
+					lock.unlock();
+					Common::Thread::SleepMicro(WAIT_ADDRESS_POLL_MICROS);
+					lock.lock();
+					continue;
 				}
-				continue;
 			}
-
-			auto& submission = ready->front();
 			lock.unlock();
 			int      result       = OK;
 			uint32_t error_offset = 0;
@@ -1315,15 +1323,16 @@ private:
 			}
 			lock.lock();
 			if (complete) {
-				ready->pop_front();
+				queue.submissions.pop_front();
 			}
 		}
 	}
 
-	std::mutex                          m_mutex;
-	std::condition_variable             m_cv;
-	std::vector<std::deque<Submission>> m_queues;
-	std::jthread                        m_worker;
+	static constexpr uint32_t WAIT_ADDRESS_POLL_MICROS = 100;
+
+	std::vector<std::unique_ptr<Queue>> m_queues;
+	// Declared last so the workers stop before the queues they use are destroyed.
+	std::vector<std::jthread> m_workers;
 };
 
 static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t bytes,
@@ -1381,6 +1390,47 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// Keeps the files a worker read recently open. Opening a file for every read is slow on Windows,
+// where file-system filters such as antivirus also inspect every open. Each worker owns its cache,
+// so the shared file position needs no locking. Resolved APR paths and sizes are already cached
+// for the whole session, so the files are not expected to change while open.
+class OpenFileCache {
+public:
+	static OpenFileCache& ForThisThread() {
+		static thread_local OpenFileCache cache;
+		return cache;
+	}
+
+	Common::File* Get(const std::string& host_path) {
+		const auto found =
+		    std::find_if(m_entries.begin(), m_entries.end(),
+		                 [&](const Entry& entry) { return entry.path == host_path; });
+		if (found != m_entries.end()) {
+			std::rotate(m_entries.begin(), found, std::next(found));
+			return m_entries.front().file.get();
+		}
+		auto file = std::make_unique<Common::File>();
+		if (!file->Open(host_path, Common::File::Mode::Read)) {
+			return nullptr;
+		}
+		if (m_entries.size() == MAX_OPEN_FILES) {
+			m_entries.pop_back();
+		}
+		m_entries.insert(m_entries.begin(), Entry {host_path, std::move(file)});
+		return m_entries.front().file.get();
+	}
+
+private:
+	struct Entry {
+		std::string                   path;
+		std::unique_ptr<Common::File> file;
+	};
+
+	static constexpr size_t MAX_OPEN_FILES = 32;
+
+	std::vector<Entry> m_entries;
+};
+
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	if (bytes_read == nullptr) {
@@ -1395,24 +1445,22 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
+	auto* cached = OpenFileCache::ForThisThread().Get(host_path);
+	if (cached == nullptr) {
 		LOGF("\tAPR read missing host file: %s\n", host_path.c_str());
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
+	auto&      file      = *cached;
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
-		file.Close();
 		return OK;
 	}
 	if (!file.Seek(file_offset)) {
-		file.Close();
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
 	if (readable == 0) {
-		file.Close();
 		return OK;
 	}
 
@@ -1433,7 +1481,6 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		*bytes_read += read;
 	}
 
-	file.Close();
 	return OK;
 }
 
