@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
 #include <span>
 #include <utility>
@@ -79,6 +80,9 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// True when queued GPU work can still read or write guest memory in the range: a cached
+	// buffer overlaps it, or fault processing may create buffers when its tick completes.
+	[[nodiscard]] bool HasPendingGpuAccess(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -141,6 +145,8 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Asynchronous downloads publish into guest memory from a completion callback.
+	std::atomic<uint32_t> m_pending_downloads {0};
 };
 
 } // namespace Libs::Graphics

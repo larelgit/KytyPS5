@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 
@@ -21,6 +22,11 @@ public:
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
 	void                  ProcessFaultBuffer();
+	// Fault areas are cleared by their completion callback, which may create cache buffers.
+	[[nodiscard]] bool HasPendingFaults() const noexcept {
+		return std::any_of(m_fault_areas.begin(), m_fault_areas.end(),
+		                   [](uint64_t tick) { return tick != 0; });
+	}
 
 private:
 	GraphicContext&                            m_graphics;

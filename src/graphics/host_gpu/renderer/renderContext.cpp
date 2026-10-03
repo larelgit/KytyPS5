@@ -98,8 +98,20 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	{
+		// Maps into free or reserved address space come through here too. A range that is not
+		// GPU-mapped has nothing cached and nothing pending: its own unmap already drained and
+		// invalidated it. Skipping it avoids a GPU-thread round trip for every new mapping.
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// Drain only when queued GPU work can still touch the range. Unmapping CPU-only memory
+		// must not stall the GPU until it is idle.
+		if (m_command_scheduler.Active() && (m_buffer_cache.HasPendingGpuAccess(vaddr, size) ||
+		                                     m_texture_cache.HasPendingGpuAccess(vaddr, size))) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

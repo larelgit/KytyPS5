@@ -180,7 +180,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_pending_downloads.fetch_add(1, std::memory_order_relaxed);
+		m_scheduler.DeferPriorityOperation([this, publish = std::move(publish)]() mutable {
+			publish();
+			m_pending_downloads.fetch_sub(1, std::memory_order_release);
+		});
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
@@ -585,6 +589,12 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::HasPendingGpuAccess(uint64_t vaddr, uint64_t size) {
+	return m_pending_downloads.load(std::memory_order_acquire) != 0 ||
+	       m_fault_manager.HasPendingFaults() || IsRegionRegistered(vaddr, size) ||
+	       m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

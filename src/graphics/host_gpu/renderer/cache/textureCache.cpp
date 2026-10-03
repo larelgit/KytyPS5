@@ -1832,9 +1832,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_pending_downloads.fetch_add(1, std::memory_order_relaxed);
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_pending_downloads.fetch_sub(1, std::memory_order_release);
 	});
 	return true;
 }
@@ -1935,6 +1937,21 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 		found->second.clear_mask &= ~(1u << slice);
 	}
 	return true;
+}
+
+bool TextureCache::HasPendingGpuAccess(uint64_t address, uint64_t size) {
+	if (m_pending_downloads.load(std::memory_order_acquire) != 0) {
+		return true;
+	}
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       metadata = m_surface_metas.lower_bound(address);
+	if (metadata != m_surface_metas.end() && metadata->first < address + size) {
+		return true;
+	}
+	return !FindImagesInRegion(address, size, false).empty();
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
