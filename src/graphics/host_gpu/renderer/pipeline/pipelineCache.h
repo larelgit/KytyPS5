@@ -9,7 +9,9 @@
 #include "graphics/shader/shader.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -18,6 +20,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -105,13 +108,14 @@ struct ShaderProgram {
 };
 
 // The owning renderer serializes access. A background thread also saves the driver cache while
-// the GPU is running; Vulkan pipeline caches are internally synchronized.
+// the GPU is running; Vulkan pipeline caches are internally synchronized. With background
+// compilation enabled, worker threads create graphics pipelines from copied draw state.
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
-	// Stops the background saver, writes the driver cache and releases it.
+	// Stops background work, writes the driver cache and releases it.
 	void Save();
 
 	struct Pipeline {
@@ -119,6 +123,8 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// False while a background compile owns the fields above.
+		std::atomic<bool> ready {true};
 	};
 
 	struct GraphicsPrograms {
@@ -139,17 +145,22 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	// True when new graphics pipelines may compile on worker threads (--async-pipelines).
+	[[nodiscard]] bool CompilesInBackground() const noexcept { return m_async_compile; }
+	// With may_defer, a pipeline that has to be compiled is built by a worker and nullptr is
+	// returned until it is ready; the caller skips the draw. Otherwise the call waits for it.
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              const GraphicsPrograms& programs, bool may_defer);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
 private:
 	struct ProgramCache;
+	struct GraphicsPipelineJob;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -188,20 +199,36 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
+	bool                                             m_async_compile = false;
+	std::mutex                                       m_compile_mutex;
+	std::condition_variable_any                      m_compile_queued;
+	std::condition_variable                          m_compile_finished;
+	std::deque<std::unique_ptr<GraphicsPipelineJob>> m_compile_queue; // Guarded by m_compile_mutex.
+	// Declared last so the workers stop before anything they use is destroyed.
+	std::vector<std::jthread> m_compile_workers;
+
 	void InitializeDriverCache();
 	void SaveThread(std::stop_token stop);
 	bool WriteDriverCache();
+	void StartCompileWorkers();
+	void StopCompileWorkers();
+	void CompileWorker(std::stop_token stop);
+	void RunGraphicsJob(GraphicsPipelineJob& job);
+	void WaitForPipeline(Pipeline& pipeline);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+// With cached_only, creation fails instead of compiling when the driver's caches do not already
+// hold the pipeline (pipelineCreationCacheControl); it then returns false and leaves the
+// pipeline empty. Otherwise it always returns true.
+bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
                             std::span<const ShaderVertexInputInfo> vertex_info,
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+                            vk::PipelineCache driver_cache, bool cached_only = false);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

@@ -19,6 +19,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <span>
 #include <vector>
@@ -95,11 +96,10 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	const auto fmt        = res.Format();
 	const auto raw_format = res.RawFormat();
 	if (raw_format == kTemporaryVertexAttribFormat113) {
-		static bool logged_113 = false;
-		if (!logged_113) {
+		static std::atomic_bool logged_113 = false;
+		if (!logged_113.exchange(true, std::memory_order_relaxed)) {
 			LOGF("InputFormat: temporary: accepting invalid PS5 buffer format 113 as "
 			     "vk::Format::eR32G32B32A32Sfloat\n");
-			logged_113 = true;
 		}
 		format = vk::Format::eR32G32B32A32Sfloat;
 		size   = 4;
@@ -110,10 +110,9 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		return;
 	}
 	if (raw_format == kTemporaryPs5BufferFormat121) {
-		static bool logged_121 = false;
-		if (!logged_121) {
+		static std::atomic_bool logged_121 = false;
+		if (!logged_121.exchange(true, std::memory_order_relaxed)) {
 			LOGF("InputFormat: accepting PS5 buffer format 121 as vk::Format::eR16G16Sfloat\n");
-			logged_121 = true;
 		}
 		format = vk::Format::eR16G16Sfloat;
 		size   = 2;
@@ -209,14 +208,14 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
                             std::span<const ShaderVertexInputInfo> vertex_info,
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache) {
+                            vk::PipelineCache driver_cache, bool cached_only) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -322,11 +321,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 
 		if (vs_input_info.resources[index].OutOfBounds() != 0) {
-			static bool logged = false;
-			if (!logged) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				LOGF("VertexInput: temporary: accepting PS5 out-of-bounds behavior %" PRIu8 "\n",
 				     vs_input_info.resources[index].OutOfBounds());
-				logged = true;
 			}
 		}
 
@@ -536,6 +534,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDynamicState           = &dynamic_state;
 	pipeline_info.layout                  = pipeline.pipeline_layout;
 	pipeline_info.basePipelineIndex       = -1;
+	if (cached_only) {
+		pipeline_info.flags = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -554,9 +555,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	const bool compile_required = cached_only && result == vk::Result::ePipelineCompileRequired;
+	if (!compile_required) {
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	}
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -564,6 +567,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
+	if (compile_required) {
+		graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+		graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+		pipeline.pipeline              = nullptr;
+		pipeline.pipeline_layout       = nullptr;
+		pipeline.descriptor_set_layout = nullptr;
+		return false;
+	}
+	return true;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
