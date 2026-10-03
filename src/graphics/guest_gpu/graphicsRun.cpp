@@ -443,6 +443,9 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	// Guest threads can run above normal priority. This thread processes every GPU queue, so
+	// keep it ahead of them to avoid a priority inversion when the guest waits on the GPU.
+	Common::Thread::SetCurrentPriority(Common::ThreadPriority::Highest);
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 

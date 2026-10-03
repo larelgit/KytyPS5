@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -266,6 +267,8 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	// Completion callbacks deliver flips and interrupts that guest threads wait on.
+	Common::Thread::SetCurrentPriority(Common::ThreadPriority::Highest);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{

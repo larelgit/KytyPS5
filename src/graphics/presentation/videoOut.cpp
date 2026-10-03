@@ -853,6 +853,8 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	// The virtual vblank paces the guest; keep it ahead of busy guest threads.
+	Common::Thread::SetCurrentPriority(Common::ThreadPriority::Highest);
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 

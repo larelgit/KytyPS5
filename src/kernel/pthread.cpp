@@ -2148,7 +2148,8 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
 	if (param->sched_priority <= 478) {
-		pparam.sched_priority = +2;
+		// THREAD_PRIORITY_ABOVE_NORMAL: emulator GPU and present threads run at HIGHEST.
+		pparam.sched_priority = +1;
 	} else if (param->sched_priority >= 733) {
 		pparam.sched_priority = -2;
 	} else {
@@ -3486,7 +3487,8 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (prio <= 478) {
-		param.sched_priority = +2;
+		// THREAD_PRIORITY_ABOVE_NORMAL: emulator GPU and present threads run at HIGHEST.
+		param.sched_priority = +1;
 	} else if (prio >= 733) {
 		param.sched_priority = -2;
 	} else {

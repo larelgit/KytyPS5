@@ -1,6 +1,7 @@
 #include "common/archive.h"
 
 #include "common/stringUtils.h"
+#include "common/threads.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -210,6 +211,7 @@ private:
 	}
 
 	void Loop() {
+		Thread::SetCurrentPriority(ThreadPriority::AboveNormal);
 		for (;;) {
 			Request* request;
 			{

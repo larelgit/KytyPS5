@@ -17,6 +17,9 @@
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
 #define KYTY_POSIX_HIGH_RES_SLEEP
 #include <ctime>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 #include <sstream>
@@ -226,6 +229,29 @@ void Thread::SleepMicro(uint32_t micros) {
 	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000);
 #else
 	std::this_thread::sleep_for(std::chrono::microseconds(micros));
+#endif
+}
+
+void Thread::SetCurrentPriority(ThreadPriority priority) {
+#ifdef KYTY_WIN_CS
+	int value = THREAD_PRIORITY_NORMAL;
+	switch (priority) {
+		case ThreadPriority::Normal: value = THREAD_PRIORITY_NORMAL; break;
+		case ThreadPriority::AboveNormal: value = THREAD_PRIORITY_ABOVE_NORMAL; break;
+		case ThreadPriority::Highest: value = THREAD_PRIORITY_HIGHEST; break;
+	}
+	(void)SetThreadPriority(GetCurrentThread(), value);
+#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
+	int nice_value = 0;
+	switch (priority) {
+		case ThreadPriority::Normal: nice_value = 0; break;
+		case ThreadPriority::AboveNormal: nice_value = -2; break;
+		case ThreadPriority::Highest: nice_value = -5; break;
+	}
+	// Linux applies the nice value to the calling thread only.
+	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), nice_value);
+#else
+	(void)priority;
 #endif
 }
 

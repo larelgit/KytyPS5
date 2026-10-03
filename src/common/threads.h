@@ -17,6 +17,8 @@ struct ThreadPrivate;
 struct MutexPrivate;
 struct CondVarPrivate;
 
+enum class ThreadPriority { Normal, AboveNormal, Highest };
+
 class Thread {
 public:
 	Thread(thread_func_t func, void* arg);
@@ -34,6 +36,10 @@ public:
 	static void SleepMicro(uint32_t micros);
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
+
+	// Best effort. Windows sets the thread priority; Linux sets the thread's nice value, which
+	// needs CAP_SYS_NICE (or RLIMIT_NICE) to raise, so a failure is ignored.
+	static void SetCurrentPriority(ThreadPriority priority);
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.
