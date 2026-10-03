@@ -1267,6 +1267,21 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return EDEADLK;
 	}
 
+	if (mutex->owner != nullptr && (timeout_us == nullptr || *timeout_us > 0)) {
+		// Guest critical sections are usually short, and the adaptive mutexes guests expect spin
+		// before sleeping. Sleeping and waking costs tens of microseconds, so spin for roughly
+		// one to two microseconds first.
+		constexpr uint32_t SpinRounds         = 8;
+		constexpr uint32_t PausesPerSpinRound = 16;
+		for (uint32_t round = 0; round < SpinRounds && mutex->owner != nullptr; round++) {
+			lock.unlock();
+			for (uint32_t pause = 0; pause < PausesPerSpinRound; pause++) {
+				__builtin_ia32_pause();
+			}
+			lock.lock();
+		}
+	}
+
 	if (timeout_us == nullptr) {
 		while (mutex->owner != nullptr) {
 			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
