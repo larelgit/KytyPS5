@@ -128,11 +128,12 @@ struct TestCompileResult {
   ShaderRecompiler::IR::ResourceSnapshot resources;
 };
 
-TestCompileResult RecompileForTest(
-    std::span<const uint32_t> code,
-    const ShaderRecompiler::CompileOptions &options,
-    ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr,
-    void *read_memory_data = nullptr, uint32_t push_data_start_dword = 0) {
+TestCompileResult
+RecompileForTest(std::span<const uint32_t> code,
+                 const ShaderRecompiler::CompileOptions &options,
+                 ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr,
+                 void *read_memory_data = nullptr,
+                 uint32_t push_data_start_dword = 0, bool emit_spirv = true) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -148,7 +149,8 @@ TestCompileResult RecompileForTest(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), options, specialization, push_data_start_dword,
+      emit_spirv);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -10782,6 +10784,35 @@ void TestNewShaderRecompilerClipDisabledPosition() {
         "clip-space half extent is absent from the shader cache key");
 }
 
+void TestDeferredSpirvEmissionMatches() {
+  // The shader disk cache compiles without SPIR-V to derive metadata and emits
+  // SPIR-V separately on a miss. Both must match a regular compile.
+  const uint32_t shader[] = {
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  ShaderVertexInputInfo vertex{};
+  vertex.clip_space = {
+      .scale = {640.0f, 360.0f},
+      .offset = {640.0f, 360.0f},
+      .half_extent = {8192.0f, 8192.0f},
+      .enabled = true,
+  };
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  const auto regular = RecompileForTest(shader, options);
+  const auto deferred =
+      RecompileForTest(shader, options, nullptr, nullptr, 0, false);
+  Check(deferred.spirv.empty(),
+        "CompileProgram emitted SPIR-V although emission was deferred");
+  Check(ShaderRecompiler::EmitSpirv(deferred.program, options) == regular.spirv,
+        "deferred SPIR-V emission differs from a regular compile");
+  Check(deferred.program.bindings == regular.program.bindings &&
+            deferred.program.info == regular.program.info,
+        "deferred SPIR-V emission changed the shader metadata");
+}
+
 void TestNewShaderRecompilerAuxPositionExports() {
   const auto compile = [](std::span<const uint32_t> shader, uint32_t control) {
     ShaderVertexInputInfo vertex{};
@@ -14327,6 +14358,7 @@ int main() {
   TestVertexBufferGrouping();
   TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
+  TestDeferredSpirvEmissionMatches();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();

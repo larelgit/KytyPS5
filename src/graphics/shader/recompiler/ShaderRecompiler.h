@@ -39,10 +39,15 @@ struct CompileResult {
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
+// Without emit_spirv the result carries the final program and its metadata but no SPIR-V;
+// EmitSpirv produces it later, or a cached module built from the same inputs is used.
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,
                                            const CompileOptions& options,
                                            const IR::ResourceSpecialization& specialization,
-	                                       uint32_t push_data_start_dword = 0);
+	                                       uint32_t push_data_start_dword = 0,
+	                                       bool     emit_spirv            = true);
+[[nodiscard]] std::vector<uint32_t> EmitSpirv(const IR::Program&    program,
+                                              const CompileOptions& options);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

@@ -12,11 +12,13 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
+#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -172,6 +174,92 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// Opens the persistent SPIR-V cache of the running title. Recompiler changes alter its output,
+// so the file is tied to the emulator revision; builds without a clean revision skip it.
+std::unique_ptr<ShaderDiskCache> OpenShaderDiskCache() {
+	const auto title_id = PipelineCacheTitleId();
+	if (title_id.empty()) {
+		return nullptr;
+	}
+	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+		PipelineCacheLog("Shader cache: disabled (non-Release build)");
+		return nullptr;
+	}
+	const std::string_view git_hash     = KYTY_GIT_HASH;
+	const std::string_view git_revision = KYTY_GIT_REVISION;
+	if (git_hash == "unknown" || git_revision == "unknown") {
+		PipelineCacheLog("Shader cache: disabled (unknown git revision)");
+		return nullptr;
+	}
+	if (git_hash.ends_with("-dirty")) {
+		PipelineCacheLog("Shader cache: disabled (build has uncommitted changes)");
+		return nullptr;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr std::string_view Platform = "windows";
+#elif defined(__APPLE__)
+	constexpr std::string_view Platform = "macos";
+#else
+	constexpr std::string_view Platform = "linux";
+#endif
+	const auto path      = std::filesystem::path("_ShaderCache") / (title_id + ".bin");
+	const auto signature = fmt::format("KytySPV1:{}:{}", git_revision, Platform);
+	auto       cache     = ShaderDiskCache::Open(path, signature);
+	if (cache == nullptr) {
+		PipelineCacheLog("Shader cache: disabled (cannot open {})", Common::PathToString(path));
+		return nullptr;
+	}
+	PipelineCacheLog("Shader cache: {} modules in {}", cache->EntryCount(),
+	                 Common::PathToString(path));
+	return cache;
+}
+
+// Hash of the interface the renderer derives from a compiled program: bindings, push data and
+// stage inputs and outputs. A cached module is used only when its program still has this.
+uint64_t ShaderInterfaceFingerprint(const ShaderRecompiler::IR::Program& program) {
+	ShaderDiskCache::KeyBuilder builder;
+	builder.Add(static_cast<uint32_t>(program.stage));
+	builder.Add(program.wave_size);
+	builder.Add(program.scratch_dwords);
+	builder.Add(program.user_data_base);
+	builder.Add(program.user_data_count);
+	builder.Add(static_cast<uint32_t>(program.has_address_writes));
+	const auto& bindings = program.bindings;
+	builder.Add(bindings.push_data_start_dword);
+	builder.Add(bindings.memory_offset_dword);
+	builder.Add(bindings.memory_offset_count);
+	builder.Add(bindings.clip_space_dwords);
+	builder.Add(std::span<const uint32_t>(bindings.user_data_registers));
+	builder.Add(static_cast<uint32_t>(bindings.descriptors.size()));
+	for (const auto& descriptor: bindings.descriptors) {
+		builder.Add(static_cast<uint32_t>(descriptor.kind));
+		builder.Add(std::span<const uint32_t>(descriptor.resources));
+	}
+	const auto& info = program.info;
+	builder.Add(static_cast<uint32_t>(info.buffers.size()));
+	builder.Add(static_cast<uint32_t>(info.images.size()));
+	builder.Add(static_cast<uint32_t>(info.samplers.size()));
+	builder.Add(static_cast<uint32_t>(info.sampled_pairs.size()));
+	builder.Add(static_cast<uint32_t>(info.inputs.size()));
+	for (const auto& input: info.inputs) {
+		builder.Add(static_cast<uint32_t>(input.kind));
+		builder.Add(input.location);
+		builder.Add(input.component_count);
+		builder.Add(static_cast<uint32_t>(input.per_vertex));
+	}
+	builder.Add(static_cast<uint32_t>(info.outputs.size()));
+	for (const auto& output: info.outputs) {
+		builder.Add(static_cast<uint32_t>(output.kind));
+		builder.Add(output.index);
+		builder.Add(output.location);
+	}
+	builder.Add(info.vertex_fetch_components.data(), info.vertex_fetch_components.size());
+	builder.Add(static_cast<uint32_t>(info.uses_dma));
+	builder.Add(static_cast<uint32_t>(info.clip_space_transform));
+	const auto hash = builder.Finish();
+	return hash.low ^ hash.high;
+}
+
 } // namespace
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -247,13 +335,70 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
+	// Identifies a permutation by everything the recompiler reads for it. The file signature
+	// covers the emulator revision. lookup_key must describe the program being compiled.
+	[[nodiscard]] ShaderDiskCache::Key
+	DiskKey(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
+	        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	        uint32_t                                            push_data_start_dword) const {
+		using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
+		// Hash every field below; these catch most additions.
+		static_assert(sizeof(Specialization::Buffer) == 16);
+		static_assert(sizeof(Specialization::Image) == 36);
+		ShaderDiskCache::KeyBuilder builder;
+		builder.Add(static_cast<uint32_t>(lookup_key.stage));
+		builder.Add(lookup_key.hash);
+		builder.Add(lookup_key.user_data_count);
+		builder.Add(options.user_data_base);
+		builder.Add(options.wave_size);
+		builder.Add(params.code);
+		builder.Add(params.back_code);
+		builder.Add(std::span<const uint32_t>(lookup_key.static_state));
+		builder.Add(static_cast<uint32_t>(specialization.buffers.size()));
+		for (const auto& buffer: specialization.buffers) {
+			builder.Add(buffer.packed_stride);
+			builder.Add(static_cast<uint32_t>(buffer.descriptor_format));
+			builder.Add(buffer.descriptor_swizzle);
+			builder.Add(static_cast<uint32_t>(buffer.zero_stride_oob));
+		}
+		builder.Add(static_cast<uint32_t>(specialization.images.size()));
+		for (const auto& image: specialization.images) {
+			builder.Add(static_cast<uint32_t>(image.numeric_class));
+			builder.Add(static_cast<uint32_t>(image.dimension));
+			builder.Add(image.mip_count);
+			builder.Add(static_cast<uint32_t>(image.conversion_format));
+			builder.Add(image.shader_swizzle);
+			builder.Add(image.indirect_root);
+			builder.Add(image.indirect_mapping_offset);
+			builder.Add(image.indirect_search_iterations);
+			builder.Add(static_cast<uint32_t>(image.cube));
+			builder.Add(static_cast<uint32_t>(image.fmask));
+		}
+		builder.Add(push_data_start_dword);
+		return builder.Finish();
+	}
+
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+	                               uint32_t                    push_data_start_dword,
+	                               const ShaderDiskCache::Key* disk_key) {
+		// With the disk cache, the program's metadata still comes from compiling it; only the
+		// SPIR-V emission is replaced by a cached module built from the same inputs.
+		const bool use_disk = disk_cache != nullptr && disk_key != nullptr;
+		auto       result   = ShaderRecompiler::CompileProgram(
+		    std::move(translated), options, specialization, push_data_start_dword, !use_disk);
+		if (use_disk) {
+			const auto fingerprint = ShaderInterfaceFingerprint(result.program);
+			if (disk_cache->Load(*disk_key, fingerprint, result.spirv)) {
+				disk_hits++;
+			} else {
+				result.spirv = ShaderRecompiler::EmitSpirv(result.program, options);
+				disk_cache->Store(*disk_key, fingerprint, result.spirv);
+				disk_misses++;
+			}
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
@@ -368,8 +513,13 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
+		std::optional<ShaderDiskCache::Key> disk_key;
+		if (disk_cache != nullptr) {
+			disk_key = DiskKey(params, options, entry->second.specialization, push_data_cursor);
+		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    stage_name, options, std::move(translated), entry->second.specialization,
+		    push_data_cursor, disk_key ? &*disk_key : nullptr));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -406,6 +556,9 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+	std::unique_ptr<ShaderDiskCache>                            disk_cache;
+	uint64_t                                                    disk_hits   = 0;
+	uint64_t                                                    disk_misses = 0;
 };
 
 // Copied draw state for a graphics pipeline compiled on a worker. Program pointers stay valid:
@@ -425,6 +578,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	m_program_cache->disk_cache = OpenShaderDiskCache();
 	if (Config::AsyncPipelinesEnabled()) {
 		StartCompileWorkers();
 	}
@@ -626,6 +780,11 @@ void PipelineCache::WaitForPipeline(Pipeline& pipeline) {
 void PipelineCache::Save() {
 	// Workers finish the pipelines they are compiling so the saved cache includes them.
 	StopCompileWorkers();
+	if (m_program_cache->disk_cache != nullptr) {
+		PipelineCacheLog("Shader cache: {} modules loaded, {} compiled this session",
+		                 m_program_cache->disk_hits, m_program_cache->disk_misses);
+		m_program_cache->disk_cache.reset();
+	}
 	if (m_save_thread.joinable()) {
 		m_save_thread.request_stop();
 		m_save_thread.join();
